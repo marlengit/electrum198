@@ -122,6 +122,12 @@ class ElectrumWindow(QMainWindow):
         self.config = config
         self.network = network
 
+        self.scatter_processing = False
+        self.scatter_last_broadcast = 0
+        self.scatter_delay = 0
+        #added for scatter_process ? not sure if this is a security risk
+        self.password = ""
+
         self._close_electrum = False
         self.lite = None
 
@@ -153,7 +159,8 @@ class ElectrumWindow(QMainWindow):
         self.column_widths = self.config.get("column_widths_2", default_column_widths )
         tabs.addTab(self.create_history_tab(), _('History') )
         tabs.addTab(self.create_send_tab(), _('Send') )
-        tabs.addTab(self.create_receive_tab(), _('Receive') )
+        tabs.addTab(self.create_receivedetail_tab(), _('Receive') )
+        tabs.addTab(self.create_receive_tab(), _('Addresses') )
         tabs.addTab(self.create_contacts_tab(), _('Contacts') )
         tabs.addTab(self.create_console_tab(), _('Console') )
         tabs.setMinimumSize(600, 400)
@@ -369,6 +376,7 @@ class ElectrumWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction(_("&Sign/verify message"), self.sign_verify_message)
         #tools_menu.addAction(_("&Encrypt/decrypt message"), self.encrypt_message)
+        tools_menu.addAction(_("&Bulk sign transactions"), self.bulk_sign)
         tools_menu.addSeparator()
 
         csv_transaction_menu = tools_menu.addMenu(_("&Create transaction"))
@@ -379,6 +387,10 @@ class ElectrumWindow(QMainWindow):
         raw_transaction_menu.addAction(_("&From file"), self.do_process_from_file)
         raw_transaction_menu.addAction(_("&From text"), self.do_process_from_text)
         raw_transaction_menu.addAction(_("&From the blockchain"), self.do_process_from_txid)
+
+        scatter_menu = tools_menu.addMenu(_("S&catter"))
+        scatter_menu.addAction(_("&Start Scatter"), self.scatter_start)
+        scatter_menu.addAction(_("S&top Scatter"), self.scatter_stop)
 
         help_menu = menubar.addMenu(_("&Help"))
         help_menu.addAction(_("&About"), self.show_about)
@@ -498,9 +510,15 @@ class ElectrumWindow(QMainWindow):
 
                 self.tray.setToolTip(text)
                 icon = QIcon(":icons/status_connected.png")
+
+                # if scatter is on then try to process now
+                if self.wallet.scatter_on and not self.scatter_processing: self.scatter_process() 
         else:
             text = _("Not connected")
             icon = QIcon(":icons/status_disconnected.png")
+
+            # if scatter is on then try to process now
+            if self.wallet.scatter_on and not self.scatter_processing: self.scatter_process() 	
 
         self.balance_label.setText(text)
         self.status_button.setIcon( icon )
@@ -511,6 +529,7 @@ class ElectrumWindow(QMainWindow):
         if self.wallet.up_to_date or not self.network or not self.network.is_connected():
             self.update_history_tab()
             self.update_receive_tab()
+            self.update_receivedetail_tab()
             self.update_contacts_tab()
             self.update_completions()
 
@@ -572,13 +591,12 @@ class ElectrumWindow(QMainWindow):
         self.is_edit=False
 
 
-    def edit_label(self, is_recv):
-        l = self.receive_list if is_recv else self.contacts_list
+    def edit_label(self, l):
         item = l.currentItem()
         item.setFlags(Qt.ItemIsEditable|Qt.ItemIsSelectable | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsDragEnabled)
         l.editItem( item, 1 )
         item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsDragEnabled)
-
+        
 
 
     def address_label_clicked(self, item, column, l, column_addr, column_label):
@@ -605,6 +623,7 @@ class ElectrumWindow(QMainWindow):
             if changed:
                 self.update_history_tab()
                 self.update_completions()
+                self.update_receivedetail_tab()
 
             self.current_item_changed(item)
 
@@ -614,6 +633,15 @@ class ElectrumWindow(QMainWindow):
     def current_item_changed(self, a):
         run_hook('current_item_changed', a)
 
+
+    def current_recevedetailitem_dblclick(self, a):
+        selected = self.receivedetail_list.selectedItems()
+        #multi_select = len(selected) > 1
+        addrs = [unicode(item.text(0)) for item in selected]
+        
+        self.show_qrcode("bitcoin:" + addrs[0], _("Address"))
+        
+        run_hook('current_recevedetailitem_dblclick', a)
 
 
     def update_history_tab(self):
@@ -671,7 +699,7 @@ class ElectrumWindow(QMainWindow):
         self.history_list.setCurrentItem(self.history_list.topLevelItem(0))
         run_hook('history_tab_update')
 
-
+    
     def create_send_tab(self):
         w = QWidget()
 
@@ -962,11 +990,35 @@ class ElectrumWindow(QMainWindow):
             elif addr not in self.wallet.frozen_addresses and freeze:
                 self.wallet.freeze(addr)
         self.update_receive_tab()
+        self.update_receivedetail_tab()
 
 
 
     def create_list_tab(self, headers):
         "generic tab creation method"
+        l = MyTreeWidget(self)
+        l.setColumnCount( len(headers) )
+        l.setHeaderLabels( headers )
+
+        w = QWidget()
+        vbox = QVBoxLayout()
+        w.setLayout(vbox)
+
+        vbox.setMargin(0)
+        vbox.setSpacing(0)
+        vbox.addWidget(l)
+        buttons = QWidget()
+        vbox.addWidget(buttons)
+
+        hbox = QHBoxLayout()
+        hbox.setMargin(0)
+        hbox.setSpacing(0)
+        buttons.setLayout(hbox)
+
+        return l,w,hbox
+    
+    def create_listform_tab(self, headers):
+        "not used yet > tab creation method half list half form"
         l = MyTreeWidget(self)
         l.setColumnCount( len(headers) )
         l.setHeaderLabels( headers )
@@ -1003,12 +1055,48 @@ class ElectrumWindow(QMainWindow):
         return w
 
 
+    def create_receivedetail_tab(self):
+        w = QWidget()
+        
+        grid = QGridLayout()
+        #grid.setSpacing(8)
+        #grid.setColumnMinimumWidth(3,300)
+        grid.setColumnStretch(5,0)
+        
+        self.from_label = QLabel(_('Double click an address to display the QR code.'))
+        grid.addWidget(self.from_label, 0, 0)
+        
+        l,w2,hbox = self.create_list_tab([ _('Address'), _('Label'), _('Balance'), _('Tx')])
+        #l.setContextMenuPolicy(Qt.CustomContextMenu)
+        #l.customContextMenuRequested.connect(self.create_receivedetail_menu)
+        #l.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        #self.connect(l, SIGNAL('itemDoubleClicked(QTreeWidgetItem*, int)'), lambda a, b: self.address_label_clicked(a,b,l,0,1))
+        self.connect(l, SIGNAL('itemDoubleClicked(QTreeWidgetItem*, int)'), lambda a, b: self.current_recevedetailitem_dblclick(a))
+        self.connect(l, SIGNAL('itemChanged(QTreeWidgetItem*, int)'), lambda a,b: self.address_label_changed(a,b,l,0,1))
+        self.connect(l, SIGNAL('currentItemChanged(QTreeWidgetItem*, QTreeWidgetItem*)'), lambda a,b: self.current_item_changed(a))
+        
+        
+        self.receivedetail_list = l
+        self.receivedetail_buttons_hbox = hbox
+        hbox.addStretch(1)
+        
+        grid.addWidget(w2,1,0)
+
+        w.setLayout(grid)
+        
+        return w
+
+
 
 
     def save_column_widths(self):
         self.column_widths["receive"] = []
         for i in range(self.receive_list.columnCount() -1):
             self.column_widths["receive"].append(self.receive_list.columnWidth(i))
+
+        self.column_widths["receivedetail"] = []
+        for i in range(self.receivedetail_list.columnCount() -1):
+            self.column_widths["receivedetail"].append(self.receivedetail_list.columnWidth(i))
 
         self.column_widths["history"] = []
         for i in range(self.history_list.columnCount() - 1):
@@ -1040,6 +1128,7 @@ class ElectrumWindow(QMainWindow):
         if self.question(_("Do you want to remove")+" %s "%addr +_("from your wallet?")):
             self.wallet.delete_imported_key(addr)
             self.update_receive_tab()
+            self.update_receivedetail_tab()
             self.update_history_tab()
 
     def edit_account_label(self, k):
@@ -1048,6 +1137,7 @@ class ElectrumWindow(QMainWindow):
             label = unicode(text)
             self.wallet.set_label(k,label)
             self.update_receive_tab()
+            self.update_receivedetail_tab()
 
     def account_set_expanded(self, item, k, b):
         item.setExpanded(b)
@@ -1065,10 +1155,57 @@ class ElectrumWindow(QMainWindow):
         if self.wallet.account_is_pending(k):
             menu.addAction(_("Delete"), lambda: self.delete_pending_account(k))
         menu.exec_(self.receive_list.viewport().mapToGlobal(position))
+        menu.exec_(self.receivedetail_list.viewport().mapToGlobal(position))
+
 
     def delete_pending_account(self, k):
         self.wallet.delete_pending_account(k)
         self.update_receive_tab()
+        self.update_receivedetail_tab()
+
+    def create_receivedetail_menu(self, position):
+        # fixme: this function apparently has a side effect.
+        # if it is not called the menu pops up several times
+        #self.receivedetail_list.selectedIndexes()
+
+        selected = self.receivedetail_list.selectedItems()
+        multi_select = len(selected) > 1
+        addrs = [unicode(item.text(0)) for item in selected]
+        if not multi_select:
+            item = self.receivedetail_list.itemAt(position)
+            if not item: return
+
+            addr = addrs[0]
+            if not is_valid(addr):
+                k = str(item.data(0,32).toString())
+                if k:
+                    self.create_account_menu(position, k, item)
+                else:
+                    item.setExpanded(not item.isExpanded())
+                return
+
+        menu = QMenu()
+        if not multi_select:
+            menu.addAction(_("Copy to clipboard"), lambda: self.app.clipboard().setText(addr))
+            menu.addAction(_("QR code"), lambda: self.show_qrcode("bitcoin:" + addr, _("Address")) )
+            menu.addAction(_("Edit label"), lambda: self.edit_label(self.receivedetail_list))
+            if self.wallet.seed:
+                menu.addAction(_("Private key"), lambda: self.show_private_key(addr))
+                menu.addAction(_("Sign/verify message"), lambda: self.sign_verify_message(addr))
+                #menu.addAction(_("Encrypt/decrypt message"), lambda: self.encrypt_message(addr))
+            if addr in self.wallet.imported_keys:
+                menu.addAction(_("Remove from wallet"), lambda: self.delete_imported_key(addr))
+
+        if any(addr not in self.wallet.frozen_addresses for addr in addrs):
+            menu.addAction(_("Freeze"), lambda: self.set_addrs_frozen(addrs, True))
+        if any(addr in self.wallet.frozen_addresses for addr in addrs):
+            menu.addAction(_("Unfreeze"), lambda: self.set_addrs_frozen(addrs, False))
+
+        #if any(addr not in self.wallet.frozen_addresses for addr in addrs):
+        #    menu.addAction(_("Send From"), lambda: self.send_from_addresses(addrs))
+
+        run_hook('receivedetail_menu', menu, addrs)
+        menu.exec_(self.receivedetail_list.viewport().mapToGlobal(position))
 
     def create_receive_menu(self, position):
         # fixme: this function apparently has a side effect.
@@ -1095,7 +1232,7 @@ class ElectrumWindow(QMainWindow):
         if not multi_select:
             menu.addAction(_("Copy to clipboard"), lambda: self.app.clipboard().setText(addr))
             menu.addAction(_("QR code"), lambda: self.show_qrcode("bitcoin:" + addr, _("Address")) )
-            menu.addAction(_("Edit label"), lambda: self.edit_label(True))
+            menu.addAction(_("Edit label"), lambda: self.edit_label(self.receive_list))
             if self.wallet.seed:
                 menu.addAction(_("Private key"), lambda: self.show_private_key(addr))
                 menu.addAction(_("Sign/verify message"), lambda: self.sign_verify_message(addr))
@@ -1163,13 +1300,31 @@ class ElectrumWindow(QMainWindow):
             menu.addAction(_("Pay to"), lambda: self.payto(payto_addr))
             menu.addAction(_("QR code"), lambda: self.show_qrcode("bitcoin:" + addr, _("Address")))
             if is_editable:
-                menu.addAction(_("Edit label"), lambda: self.edit_label(False))
+                menu.addAction(_("Edit label"), lambda: self.edit_label(self.contacts_list))
                 menu.addAction(_("Delete"), lambda: self.delete_contact(addr))
 
         run_hook('create_contact_menu', menu, item)
         menu.exec_(self.contacts_list.viewport().mapToGlobal(position))
 
+    def update_receivedetail_item(self, item):
+        item.setFont(0, QFont(MONOSPACE_FONT))
+        address = str(item.data(0,0).toString())
+        label = self.wallet.labels.get(address,'')
+        item.setData(1,0,label)
+        item.setData(0,32, True) # is editable
 
+        run_hook('update_receivedetail_item', address, item)
+
+        if not self.wallet.is_mine(address): return
+
+        c, u = self.wallet.get_addr_balance(address)
+        balance = self.format_amount(c + u)
+        item.setData(2,0,balance)
+
+        if address in self.wallet.frozen_addresses:
+            item.setBackgroundColor(0, QColor('lightblue'))
+            
+            
     def update_receive_item(self, item):
         item.setFont(0, QFont(MONOSPACE_FONT))
         address = str(item.data(0,0).toString())
@@ -1188,7 +1343,92 @@ class ElectrumWindow(QMainWindow):
         if address in self.wallet.frozen_addresses:
             item.setBackgroundColor(0, QColor('lightblue'))
 
+    def update_receivedetail_tab(self):
+        l = self.receivedetail_list
 
+        l.clear()
+        l.setColumnHidden(2, False)
+        l.setColumnHidden(3, False)
+        for i,width in enumerate(self.column_widths['receivedetail']):
+            l.setColumnWidth(i, width)
+
+        if self.current_account is None:
+            account_items = self.wallet.accounts.items()
+        elif self.current_account != -1:
+            account_items = [(self.current_account, self.wallet.accounts.get(self.current_account))]
+        else:
+            account_items = []
+
+        for k, account in account_items:
+            name = self.wallet.get_account_name(k)
+            c,u = self.wallet.get_account_balance(k)
+            account_item = QTreeWidgetItem( [ name, '', self.format_amount(c+u), ''] )
+            l.addTopLevelItem(account_item)
+            account_item.setExpanded(self.accounts_expanded.get(k, True))
+            account_item.setData(0, 32, k)
+
+            if not self.wallet.is_seeded(k):
+                icon = QIcon(":icons/key.png")
+                account_item.setIcon(0, icon)
+
+            for is_change in ([0]): # removed is_change ,1 from this line for the moment
+                name = _("Receiving") if not is_change else _("Change")
+                seq_item = QTreeWidgetItem( [ name, '', '', '', ''] )
+                account_item.addChild(seq_item)
+                #used_item = QTreeWidgetItem( [ _("Used"), '', '', '', ''] )
+                #used_flag = False
+                if not is_change: seq_item.setExpanded(True)
+
+                is_red = False
+                gap = 0
+
+                for address in account.get_addresses(is_change):
+                    h = self.wallet.history.get(address,[])
+
+                    if h == []:
+                        gap += 1
+                        if gap > self.wallet.gap_limit:
+                            is_red = True
+                    else:
+                        gap = 0
+
+                    c, u = self.wallet.get_addr_balance(address)
+                    num_tx = '*' if h == ['*'] else "%d"%len(h)
+                    if len(h) > 0 : continue  #unused only
+                    item = QTreeWidgetItem( [ address, '', '', num_tx] )
+                    self.update_receivedetail_item(item)
+                    if is_red:
+                        item.setBackgroundColor(1, QColor('red'))
+                    
+                    seq_item.addChild(item)
+
+
+        for k, addr in self.wallet.get_pending_accounts():
+            name = self.wallet.labels.get(k,'')
+            account_item = QTreeWidgetItem( [ name + "  [ "+_('pending account')+" ]", '', '', ''] )
+            self.update_receivedetail_item(item)
+            l.addTopLevelItem(account_item)
+            account_item.setExpanded(True)
+            account_item.setData(0, 32, k)
+            item = QTreeWidgetItem( [ addr, '', '', '', ''] )
+            account_item.addChild(item)
+            self.update_receivedetail_item(item)
+
+
+        if self.wallet.imported_keys and (self.current_account is None or self.current_account == -1):
+            c,u = self.wallet.get_imported_balance()
+            account_item = QTreeWidgetItem( [ _('Imported'), '', self.format_amount(c+u), ''] )
+            l.addTopLevelItem(account_item)
+            account_item.setExpanded(True)
+            for address in self.wallet.imported_keys.keys():
+                item = QTreeWidgetItem( [ address, '', '', ''] )
+                self.update_receivedetail_item(item)
+                account_item.addChild(item)
+
+
+        # we use column 1 because column 0 may be hidden
+        l.setCurrentItem(l.topLevelItem(0),1)
+        
     def update_receive_tab(self):
         l = self.receive_list
 
@@ -1336,6 +1576,7 @@ class ElectrumWindow(QMainWindow):
         self.update_history_tab()
         self.update_status()
         self.update_receive_tab()
+        self.update_receivedetail_tab()
 
     def create_status_bar(self):
 
@@ -2249,3 +2490,261 @@ class ElectrumWindow(QMainWindow):
 
         vbox.addLayout(close_button(d))
         d.exec_()
+
+    def scatter_process(self):
+        self.scatter_processing = True
+        
+        remaining_scatter_broadcasts = 0
+        remaining_scatter_broadcasts = self.scatter_broadcast()
+        
+
+        if remaining_scatter_broadcasts == 0: 
+            result_msg = self.wallet.scatter_make(self.password)
+            if result_msg <> "": 
+                self.console.showMessage(result_msg)
+                self.scatter_delay = 0
+           
+
+        self.scatter_processing = False
+
+
+
+    def scatter_broadcast(self):
+        import glob
+        import random
+        # this function searches the scatter_path for any UNSENT scatter files and 
+        # sends them if the scatter_delay since the last broadcast has passed
+
+        remaining_scatter_broadcasts = 0
+
+        signedFileList = glob.glob(os.path.join(self.wallet.scatter_path,"scatter_signed_UNSENT_*.txn"))
+        unsignedFileList = glob.glob(os.path.join(self.wallet.scatter_path,"scatter_unsigned_UNSENT_*.txn"))
+        
+        # delete unsigned scatter files if a signed version exists
+        for f in unsignedFileList:
+            if os.path.exists(f.replace("unsigned","signed")):
+                os.remove(f)
+                unsignedFileList.remove(f)
+
+        remaining_scatter_broadcasts = len(signedFileList) + len(unsignedFileList)
+
+        if self.scatter_delay == 0:
+            # determine a random scatter_delay between the minimum and 5x the minimum 
+            self.scatter_delay = int(random.uniform(self.wallet.scatter_delay_minimum,self.wallet.scatter_delay_minimum*5))
+            if len(unsignedFileList) > 0:
+                self.console.showMessage( (
+                    "There were %i scatter transactions found unsigned in the scatter folder.\n" +
+                    "As these are unsigned the next step is to sign the transactions " + 
+                    "and save them into the scatter folder.") % len(unsignedFileList)) 
+                    
+            if len(signedFileList) > 0:
+                self.console.showMessage("There are %i scatter transactions found signed and ready to broadcast." % len(signedFileList))
+                  
+            self.console.showMessage("The next scatter broadcast will be in %i minutes." % self.scatter_delay)
+            
+            
+        if self.wallet.up_to_date and self.network.is_connected(): 
+            # calculate minutes since last broadcast
+            if self.scatter_last_broadcast == 0:
+                mins_since_last_broadcast = 0
+                self.scatter_last_broadcast = time.time()
+            else:
+                mins_since_last_broadcast = int((time.time() - self.scatter_last_broadcast) % 36)
+
+            # check whether the time since the last broadcast is greater than the scatter_delay_minimum
+            if mins_since_last_broadcast > self.scatter_delay :
+
+                for fi in signedFileList:
+                    fileName = os.path.join(self.wallet.scatter_path,fi)
+                    self.console.showMessage('Scatter sending: ' + fileName)
+                    print 'Scatter sending: ' + fileName
+                    
+                    # load transaction from file
+                    if not fileName:
+                        return 0
+                    try:
+                        with open(fileName, "r") as f:
+                            # load transaction from file
+                            file_content = f.read()
+                            tx = self.tx_from_text(file_content)
+                            f.close()
+
+                    except Exception as e:
+                        msg = "Scatter error occured while trying to load file: " + fileName + "\nError: " + str(e)
+                        print msg		    
+                        self.console.showMessage(msg)
+
+                        self.wallet.scatter_on = False
+                        break
+
+                    self.wallet.set_label(tx.hash(), 'scatter')
+
+                    if tx.is_complete:
+                        self.balance_label.setText('Scatter send in process please wait...')
+                        # sychronous send
+                        status, msg = self.wallet.sendtx(tx)
+                        
+                        # fix this now regardless of status in case of error user has time to fix problem
+                        self.scatter_last_broadcast = time.time()				
+
+                        msg += "\n" + fileName
+                        if status:	
+                            os.rename(fileName,fileName.replace('UNSENT','SENT'))
+                            self.console.showMessage('Scatter transaction sent: '+msg)
+                            self.balance_label.setText('Scatter transaction sent: '+msg)
+                        else:
+                            self.console.showMessage('Scatter transaction send '+msg)
+                            self.balance_label.setText('Scatter transaction send '+msg)
+                    
+                    self.scatter_delay = 0
+                    # only one transaction should be broadcast
+                    break
+
+        return int(remaining_scatter_broadcasts)
+
+
+    @protected
+    def scatter_get_password(self, password):
+        self.password = password	
+
+    def scatter_stop(self):	
+        self.wallet.scatter_on = False
+        self.password = ""
+        self.console.showMessage("Scatter stopped.")
+
+    def scatter_start(self):
+
+        # create dialog
+        d = QDialog(self)
+        d.setWindowTitle(_('Start Scatter'))
+        d.setModal(1)
+        vbox = QVBoxLayout()
+        grid = QGridLayout()
+        grid.setColumnStretch(0,1)
+
+        grid.addWidget(QLabel("Scatter will make automated transactions from addresses \nwith amounts above the limit into new addresses in the same wallet \nand broadcast them at random time intervals. \nClick OK to turn on the scatter processing. \nTo turn off Scatter select Scatter Off from the menu."),1,0)
+
+        # scatter_limit widget
+        scatter_label = QLabel(_('Scatter limit') + ':')
+        grid.addWidget(scatter_label, 2, 0)
+        scatter_e = AmountEdit(self.base_unit)
+        scatter_e.setText(self.format_amount(str(self.wallet.scatter_limit)))
+        grid.addWidget(scatter_e, 2, 1)
+        msg = _('Addresses with a balance greater than the limit will be included in the scatter.') 
+        grid.addWidget(HelpButton(msg), 2, 2)
+
+
+        # scatter_fee widget
+        scatter_label = QLabel(_('Scatter fee') + ':')
+        grid.addWidget(scatter_label, 3, 0)
+        scatter_f = AmountEdit(self.base_unit)
+        scatter_f.setText(self.format_amount(str(self.wallet.scatter_fee)))
+        grid.addWidget(scatter_f, 3, 1)
+        msg = _('All scatter transactions will use this fee.') 
+        grid.addWidget(HelpButton(msg), 3, 2)
+
+        # scatter_limit widget
+        scatter_label = QLabel(_('Minimum delay') + ':')
+        grid.addWidget(scatter_label, 4, 0)
+        scatter_d = QLineEdit()
+        scatter_d.setText(str(self.wallet.scatter_delay_minimum))
+        grid.addWidget(scatter_d, 4, 1)
+        msg = _('Minimum delay in minutes between each randomly broadcasted transaction.') 
+        grid.addWidget(HelpButton(msg), 4, 2)
+
+        grid.setRowStretch(5,1)
+
+        vbox.addLayout(grid)
+        vbox.addLayout(ok_cancel_buttons(d))
+        d.setLayout(vbox)
+
+        # run the dialog
+        if not d.exec_(): return
+
+        # validate widget values 
+        try:
+            scatter_limit = self.read_amount(unicode(scatter_e.text()))
+        except Exception:
+            QMessageBox.warning(self, _('Error'), _('Invalid value') +': %s'%scatter_e.text(), _('OK'))
+            return
+
+        try:
+            scatter_fee = self.read_amount(unicode(scatter_f.text()))
+        except Exception:
+            QMessageBox.warning(self, _('Error'), _('Invalid value') +': %s'%scatter_fee.text(), _('OK'))
+            return
+
+        scatter_path = str(QFileDialog.getExistingDirectory(self,'Select the path for storing and loading scatter transactions :',self.wallet.scatter_path))
+        
+        # store widget values
+        self.wallet.scatter_limit = scatter_limit
+        self.wallet.scatter_fee = scatter_fee
+        self.wallet.scatter_path = scatter_path
+        self.wallet.scatter_delay_minimum = int(unicode(scatter_d.text()))
+
+        # save to persist
+        self.config.set_key('scatter_limit', self.wallet.scatter_limit, True)
+        self.config.set_key('scatter_fee', self.wallet.scatter_fee, True)
+        self.config.set_key('scatter_path', self.wallet.scatter_path, True)
+        self.config.set_key('scatter_delay_minimum', self.wallet.scatter_delay_minimum, True)
+
+        # run scatter
+        
+        self.wallet.scatter_on = True
+        if not self.wallet.is_watching_only(): self.scatter_get_password()
+        self.console.showMessage("Scatter started. Waiting for scatter transactions in " + self.wallet.scatter_path)
+        
+        self.update_status()
+
+
+    @protected
+    def do_bulk_sign(self, fileList, password):
+        success_count = 0
+        
+        for fileName in fileList:
+            print 'bulk signing: ' + fileName
+                    
+            # load transaction from file
+            if not fileName:
+                return 0
+            try:
+                with open(fileName, "r") as f:
+                    # load transaction from file
+                    file_content = f.read()
+                    tx = self.tx_from_text(file_content)
+
+                # sign transaction
+                self.wallet.signrawtransaction(tx, tx.inputs, [], password)
+            
+
+                # save transaction if it was signed
+                if tx.is_complete:
+                    newfileName = str(fileName).replace('unsigned','signed')
+                    if newfileName:
+                        with open(newfileName, "w+") as f:
+                            f.write(json.dumps(tx.as_dict(),indent=4) + '\n')
+
+                    success_count += 1
+
+            except Exception as e:
+                msg = "Error occured while trying to sign file: " + fileName + "\nError: " + str(e)
+                print msg		    
+                self.console.showMessage(msg)
+                continue
+
+        msg = "There were " + str(success_count) + " transactions bulk signed successfully out of %s attempted." % str(len(fileList))
+        self.console.showMessage(msg)
+        return 	
+    
+    def bulk_sign(self):
+
+        fileList = QFileDialog.getOpenFileNames(self,'Select the files to bulk sign :',os.environ["HOME"])
+
+        if len(fileList) > 0 : 
+            self.balance_label.setText('Bulk signing in progress please wait...')
+            self.do_bulk_sign(fileList)
+            self.balance_label.setText("")
+            QMessageBox.information(self,"Bulk sign", "Bulk sign completed. Check console for summary message.")
+            
+        return
+

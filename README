@@ -1,4 +1,58 @@
-Electrum - lightweight Bitcoin client - original source v1.9.8 portable
+Electrum - lightweight Bitcoin client
+CUSTOM VERSION maintained at https://github.com/marlengit/electrum198
+
+includes features:
+Receive only tab - this tab only shows fresh addresses
+Bulk signing feature - this will sign many transactions with one password entry
+Scatter feature - 
+
+The Scatter feature works as a background process which automatically 
+creates and broadcasts single input transactions from addresses with 
+balances over a user specified amount and sends them to fresh addresses. 
+It continues to automate spending into the same wallet breaking address 
+balances down into smaller and smaller amounts until all address 
+balances are below the scatter limit. 
+
+The transactions are not broadcasted immediately but are saved into 
+transaction files and broadcasted at random times. For cold wallets 
+transaction files are unsigned so need to be taken to the cold wallet, 
+bulk signed then returned to the scatter folder for broadcasting. 
+The purpose of Scatter is to assist with privacy by keeping the address 
+balances dynamic via single input trasnactions.
+ 
+All scatter transactions are single input only for privacy. 
+If unspent outputs are sent via single input transactions 
+analyses to find the source of the transactions becomes a lot harder. 
+
+If/when down the spend tree a multiple input transaction is used that can 
+spoil the privacy effect. So the scatter feature is meant support avoiding
+any multiple input transactions from occurring, ever.
+
+Since the scatter transactions will split unspent outputs above the 
+"scatter limit" and send the max of unspent outputs (minus fee) below 
+the "scatter limit" then there will be lots of addresses in the wallet 
+with small unspent outputs. This is good for privacy. 
+
+But at some point down the line the user, in order to perform a large 
+transaction would need to build a multiple input transaction thereby 
+spoiling some privacy. 
+
+To avoid this I am creating a "Slow Send via Scatter" feature which will
+break up a send into multiple single input transactions to fill up a 
+target address (frozen) slowly over time to the desired balance via the 
+scatter process i.e. via multiple single input transactions broadcasted 
+at random intervals. Once the desired balance is reached another single 
+input transaction can spend the large balance. 
+
+I'm not sure how rock solid this kind of privacy is but it will 
+certainly complicate efforts to analyze ownership of addresses.
+
+Because scatter transactions are not broadcast immediately there are 
+scatter variables which keep track of which addresses have been used 
+as inputs/outputs in unbroadcasted scatter transactions and new scatter 
+transactions will not be made until the whole batch is broadcasted. 
+The quantity of transactions in a scatter batch is restricted by the 
+gap limit. 
 
 Licence: GNU GPL v3
 Author: thomasv@bitcointalk.org
