@@ -166,7 +166,8 @@ class ElectrumWindow(QMainWindow):
         tabs.setMinimumSize(600, 400)
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCentralWidget(tabs)
-
+        
+        
         g = self.config.get("winpos-qt",[100, 100, 840, 400])
         self.setGeometry(g[0], g[1], g[2], g[3])
 
@@ -755,9 +756,12 @@ class ElectrumWindow(QMainWindow):
 
         self.send_button = EnterButton(_("Send"), self.do_send)
         grid.addWidget(self.send_button, 6, 1)
+        
+        self.sendslow_button = EnterButton(_("Slow Send via Scatter"), self.do_sendslow)
+        grid.addWidget(self.sendslow_button, 6, 2)
 
         b = EnterButton(_("Clear"),self.do_clear)
-        grid.addWidget(b, 6, 2)
+        grid.addWidget(b, 6, 3)
 
         self.payto_sig = QLabel('')
         grid.addWidget(self.payto_sig, 7, 0, 1, 4)
@@ -842,6 +846,66 @@ class ElectrumWindow(QMainWindow):
 
     def protected(func):
         return lambda s, *args: s.do_protect(func, args)
+    
+    
+    def do_sendslow(self):
+
+        label = unicode( self.message_e.text() )
+        r = unicode( self.payto_e.text() )
+        r = r.strip()
+
+        # label or alias, with address in brackets
+        m = re.match('(.*?)\s*\<([1-9A-HJ-NP-Za-km-z]{26,})\>', r)
+        to_address = m.group(2) if m else r
+        
+        
+        
+        if not is_valid(to_address):
+            QMessageBox.warning(self, _('Error'), _('Invalid Bitcoin Address') + ':\n' + to_address, _('OK'))
+            return
+
+        try:
+            amount = self.read_amount(unicode( self.amount_e.text()))
+        except Exception:
+            QMessageBox.warning(self, _('Error'), _('Invalid Amount'), _('OK'))
+            return
+        try:
+            fee = self.read_amount(unicode( self.fee_e.text()))
+        except Exception:
+            QMessageBox.warning(self, _('Error'), _('Invalid Fee'), _('OK'))
+            return
+
+        # determine the maximum amount to send per transaction
+        self.sendslow_max_amount = Decimal(amount / 5)
+
+        confirm_amount = self.config.get('confirm_amount', 100000000)
+        if amount >= confirm_amount:
+            scatter_msg = ""
+            '''
+            scatter_msg = ("Given the scatter delay setting is set to {0} minutes \n" + 
+                            "and the max amount per transaction is {1} BTC it will take at least \n" + 
+                            "{3} minutes to complete this slow send.".format(
+                                self.wallet.scatter_delay_minimum,
+                                self.sendslow_max_amount,
+                                str(int(self.wallet.scatter_delay_minimum * self.sendslow_max_amount))))  
+            '''
+            if not self.wallet.scatter_on: 
+                scatter_msg += "\nYou need to start the Scatter process for the slow spend to execute."
+            
+            if not self.question(_("Slow send %(amount)s to %(address)s?\n" + scatter_msg)%{ 'amount' : self.format_amount(amount) + ' '+ self.base_unit(), 'address' : to_address}):
+                return
+            
+        confirm_fee = self.config.get('confirm_fee', 100000)
+        if fee >= confirm_fee:
+            if not self.question(_("The fee for this transaction seems unusually high.\nAre you really sure you want to pay %(fee)s in fees?")%{ 'fee' : self.format_amount(fee) + ' '+ self.base_unit()}):
+                return
+
+        
+
+        if not self.wallet.is_watching_only(): self.scatter_get_password()
+        resultmsg = self.wallet.scatter_make(self.password, to_address, amount, fee, label, self.sendslow_max_amount)
+        QMessageBox.information(self, _('Slow Send'),resultmsg, _('OK'))
+
 
 
     def do_send(self):
@@ -1056,36 +1120,17 @@ class ElectrumWindow(QMainWindow):
 
 
     def create_receivedetail_tab(self):
-        w = QWidget()
-        
-        grid = QGridLayout()
-        #grid.setSpacing(8)
-        #grid.setColumnMinimumWidth(3,300)
-        grid.setColumnStretch(5,0)
-        
-        self.from_label = QLabel(_('Double click an address to display the QR code.'))
-        grid.addWidget(self.from_label, 0, 0)
-        
-        l,w2,hbox = self.create_list_tab([ _('Address'), _('Label'), _('Balance'), _('Tx')])
-        #l.setContextMenuPolicy(Qt.CustomContextMenu)
-        #l.customContextMenuRequested.connect(self.create_receivedetail_menu)
-        #l.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        #self.connect(l, SIGNAL('itemDoubleClicked(QTreeWidgetItem*, int)'), lambda a, b: self.address_label_clicked(a,b,l,0,1))
-        self.connect(l, SIGNAL('itemDoubleClicked(QTreeWidgetItem*, int)'), lambda a, b: self.current_recevedetailitem_dblclick(a))
+        l,w,hbox = self.create_list_tab([ _('Address'), _('Label'), _('Balance'), _('Tx')])
+        l.setContextMenuPolicy(Qt.CustomContextMenu)
+        l.customContextMenuRequested.connect(self.create_receivedetail_menu)
+        l.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.connect(l, SIGNAL('itemDoubleClicked(QTreeWidgetItem*, int)'), lambda a, b: self.address_label_clicked(a,b,l,0,1))
         self.connect(l, SIGNAL('itemChanged(QTreeWidgetItem*, int)'), lambda a,b: self.address_label_changed(a,b,l,0,1))
         self.connect(l, SIGNAL('currentItemChanged(QTreeWidgetItem*, QTreeWidgetItem*)'), lambda a,b: self.current_item_changed(a))
-        
-        
         self.receivedetail_list = l
         self.receivedetail_buttons_hbox = hbox
         hbox.addStretch(1)
-        
-        grid.addWidget(w2,1,0)
-
-        w.setLayout(grid)
-        
         return w
-
 
 
 
@@ -1618,6 +1663,8 @@ class ElectrumWindow(QMainWindow):
 
 
     def update_buttons_on_seed(self):
+        self.sendslow_button.show()
+        
         if not self.wallet.is_watching_only():
            self.seed_button.show()
            self.password_button.show()
@@ -2494,19 +2541,20 @@ class ElectrumWindow(QMainWindow):
     def scatter_process(self):
         self.scatter_processing = True
         
+        '''
         remaining_scatter_broadcasts = 0
         remaining_scatter_broadcasts = self.scatter_broadcast()
         
-
+        
         if remaining_scatter_broadcasts == 0: 
             result_msg = self.wallet.scatter_make(self.password)
             if result_msg <> "": 
                 self.console.showMessage(result_msg)
                 self.scatter_delay = 0
            
-
+        '''
         self.scatter_processing = False
-
+        
 
 
     def scatter_broadcast(self):
@@ -2577,8 +2625,6 @@ class ElectrumWindow(QMainWindow):
                         self.wallet.scatter_on = False
                         break
 
-                    self.wallet.set_label(tx.hash(), 'scatter')
-
                     if tx.is_complete:
                         self.balance_label.setText('Scatter send in process please wait...')
                         # sychronous send
@@ -2622,7 +2668,7 @@ class ElectrumWindow(QMainWindow):
         grid = QGridLayout()
         grid.setColumnStretch(0,1)
 
-        grid.addWidget(QLabel("Scatter will make automated transactions from addresses \nwith amounts above the limit into new addresses in the same wallet \nand broadcast them at random time intervals. \nClick OK to turn on the scatter processing. \nTo turn off Scatter select Scatter Off from the menu."),1,0)
+        grid.addWidget(QLabel("Scatter will make automated single input transactions \nand broadcast them at random time intervals. \nAddresses with amounts above the limit will be split up while smaller amounts will move totally.\nClick OK to turn on the scatter processing. \nTo turn off Scatter select Scatter Off from the menu."),1,0)
 
         # scatter_limit widget
         scatter_label = QLabel(_('Scatter limit') + ':')
@@ -2723,7 +2769,8 @@ class ElectrumWindow(QMainWindow):
                     if newfileName:
                         with open(newfileName, "w+") as f:
                             f.write(json.dumps(tx.as_dict(),indent=4) + '\n')
-
+                    #delete the old file
+                    os.remove(fileName)
                     success_count += 1
 
             except Exception as e:

@@ -1395,129 +1395,166 @@ class NewWallet:
 
 		
 
-    def scatter_make(self, password):
-        from decimal import Decimal
+    def scatter_make(self, password, to_address = None, to_amount = None, fee = None, label = 'scatter', max_amount = None):
         import json
-
+        # the minimum input value to scatter i.e. don't scatter dust
+        min_scatter_size = 100000  #0.001 BTC
+        
         out = ""	
         if self.up_to_date and self.network.is_connected(): 
             scatter_tx_data = []     # scatter tx data list
+            
+            if fee == None: fee = self.scatter_fee
 
-            fee = self.scatter_fee
-
-            # loop through address balances 
-            account_addresses = self.get_account_addresses(None)
+            # track slow spend
+            remaining_amount = to_amount
+            
+            # loop through address balances to find inputs
+            account_addresses = self.addresses(True)
             for in_addr in account_addresses: 
                 a = in_addr				    # input address
                 c, u = self.get_addr_balance(a)
-                b = Decimal(c + u)			# input balance
+                b = c + u           		# input balance
             
+                if b == 0: continue
                 if a in self.frozen_addresses: continue     # skip frozen addresses
                 if a in self.scatter_addr_in: continue      # skip addresses already being scattered
 
-                # For each address greater than scatter limit 
-                # prepare tx to spend a random amounts to new addresses 
-                if b >= self.scatter_limit:
-                    # determine a random spend amount
-                    divisor = Decimal(str(random.uniform(1,4)))	
-                    out_value = Decimal((b / divisor) - fee)
-                    scatter_type = 'split'
-                elif b > (fee * 1000):
-                    # for addresses less than scatter limit
-                    # spend the whole amount to a new address
-                    out_value = Decimal(b - fee)
-                    scatter_type = 'whole'
-                else: continue
+                if to_address == None:
+                    # For each address greater than scatter limit 
+                    # prepare tx to spend a random amounts to new addresses 
+                    if b >= self.scatter_limit:
+                        # determine a random spend amount
+                        divisor = random.uniform(1,4)
+                        out_value = int((b / divisor) - fee)
+                        scatter_type = 'split'
+                    elif b > (fee * 1000):
+                        # for addresses less than scatter limit
+                        # spend the whole amount to a new address
+                        out_value = b - fee
+                        scatter_type = 'whole'
+                    else: continue
+                else:
+                    # Slow Spend so for each address spend up to the max_amount until the to_amount is satisfied
+                    if remaining_amount < (max_amount + fee) and b > remaining_amount: b = remaining_amount
                     
+                    if b >= (max_amount + fee):
+                        out_value = max_amount - fee
+                        scatter_type = 'split'
+                        
+                    else:
+                        out_value = b - fee
+                        scatter_type = 'whole'
+                    
+                        
+                # don't scatter dust
+                if (out_value <= min_scatter_size): continue
+                
+                if remaining_amount <> None: remaining_amount -= out_value    
                 scatter_tx_data.append( 
                     {   'in_addr': a , 'in_value': b, 
                         'out_addr': '', 'out_value': out_value, 
                         'chg_addr': '', 'type': scatter_type} )
 
-            if len(scatter_tx_data) == 0 :
-                out = ''
-
-            else:
-            
-                # find empty out addresses ...
-                i = 0
-                for addr in account_addresses:
-                    if (self.is_mine(addr) 
-                        and not addr in self.scatter_addr_out 
-                        and not addr in self.frozen_addresses): 
-                        hist = self.get_history(addr)
-                        
-                        # address has never been used so apply it where required
-                        if len(hist) == 0 : 
-                            self.scatter_addr_out.append(addr)
-                            
-                            if scatter_tx_data[i]['type'] == 'split': 
-                                if scatter_tx_data[i]['out_addr'] == "":
-                                    scatter_tx_data[i]['out_addr'] = addr 
-                                else:
-                                    scatter_tx_data[i]['chg_addr'] = addr
-                                    i += 1
-                                    
-                            else:   # whole scatter doesn't need change address
-                                scatter_tx_data[i]['out_addr'] = addr 
-                                i += 1
-
-                    if i == len(scatter_tx_data): break
-
-                #debug
-                #for tx in scatter_tx_data:
-                #    print '{0}({1}) > {2}({3}) chg {4} : {5} >> {6})'.format(tx['in_addr'],tx['in_value'],tx['out_addr'],tx['out_value'],tx['chg_addr'],tx['type'],len(tx['out_addr']))
+                #end for in_addr in account_addresses: 
                 
-
-                # prepare to scatter balances
-                tx_list = []
-                signed_txs = []
-                saveFolder = os.path.expanduser(self.scatter_path)
-
-                # make transactions 
-                for tx_data in scatter_tx_data:
-                    # skip scatter if there were no outputs found
-                    if (len(tx_data['out_addr']) == 0 or 
-                        (tx_data['type'] == 'split' and len(tx_data['chg_addr']) == 0)): continue
-                        
-                    outputs = []	
-                    outputs.append ( (tx_data['out_addr'],int(tx_data['out_value'])) )
-
-                    if tx_data['type'] == 'split':
-                        change_addr = tx_data['chg_addr']
-                    else:
-                        change_addr = None
-                        
-                    domain = []
-                    domain.append ( tx_data['in_addr'] )
-                    self.scatter_addr_in.append(domain)
+            if (not to_address == None) and remaining_amount > min_scatter_size:
+                # not enough unspent outputs to complete slow spend
+                return 'Error: Insufficient inputs to create slow spend transactions.({0})'.format(remaining_amount)
+            
+            if len(scatter_tx_data) == 0 :
+                return ''
 
                     
-                    # make unsigned transaction
-                    tx = self.make_unsigned_transaction(outputs,fee,change_addr,domain)
-                    tx_list.append(tx)
+            # find empty out addresses ...
+            i = 0
+            for addr in account_addresses:
+                if (self.is_mine(addr) 
+                    and not addr in self.scatter_addr_out 
+                    and not addr in self.frozen_addresses): 
+                    hist = self.get_history(addr)
+                    
+                    # address has never been used so apply it where required
+                    if len(hist) == 0 : 
+                        self.scatter_addr_out.append(addr)
+                        
+                        if scatter_tx_data[i]['type'] == 'split': 
+                            if scatter_tx_data[i]['out_addr'] == "":
+                                if to_address == None:
+                                    scatter_tx_data[i]['out_addr'] = addr
+                                else:
+                                    # slow spend
+                                    scatter_tx_data[i]['out_addr'] = to_address
+                                    scatter_tx_data[i]['chg_addr'] = addr
+                                    i += 1
+                            else:
+                                scatter_tx_data[i]['chg_addr'] = addr
+                                i += 1
+                                
+                        else:   # whole scatter doesn't need change address
+                            scatter_tx_data[i]['out_addr'] = addr 
+                            i += 1
 
-                    if self.is_watching_only():		
-                        fileName = os.path.join(saveFolder,'scatter_unsigned_UNSENT_%s.txn' % (tx.hash()[0:8]))
-                        out = ("There were " + str(len(tx_list)) + 
-                                " unsigned scatter transaction files saved successfully into " + saveFolder ) 
-                    else:
-                        fileName = os.path.join(saveFolder,'scatter_signed_UNSENT_%s.txn' % (tx.hash()[0:8]))
-                        keypairs = {}
-                        self.add_keypairs_from_wallet(tx, keypairs, password)
-                        if keypairs:
-                            self.sign_transaction(tx, keypairs, password)	
-                        out = ("There were " + str(len(tx_list)) + 
-                            " signed scatter transaction files saved successfully into " + saveFolder + 
-                            ". These are signed and ready to broadcast.")
+                if i == len(scatter_tx_data): break
+            #end for addr in account_addresses:
+            
+            #debug
+            for tx in scatter_tx_data:
+                print '{0}({1}) > {2}({3}) chg {4} : {5} >> {6})'.format(tx['in_addr'],tx['in_value'],tx['out_addr'],tx['out_value'],tx['chg_addr'],tx['type'],len(tx['out_addr']))
+            
+
+            # prepare to scatter balances
+            tx_list = []
+            signed_txs = []
+            saveFolder = os.path.expanduser(self.scatter_path)
+
+            # make transactions 
+            for tx_data in scatter_tx_data:
+                # skip scatter if there were no outputs found
+                if (len(tx_data['out_addr']) == 0 or 
+                    (tx_data['type'] == 'split' and len(tx_data['chg_addr']) == 0)): continue
+                    
+                outputs = []	
+                outputs.append ( (tx_data['out_addr'],int(tx_data['out_value'])) )
+
+                if tx_data['type'] == 'split':
+                    change_addr = tx_data['chg_addr']
+                else:
+                    change_addr = None
+                    
+                domain = []
+                domain.append ( tx_data['in_addr'] )
+                self.scatter_addr_in.append(domain)
+
                 
-                    # write transaction to file
-                    if fileName:
-                        with open(fileName, "w+") as f:
-                            f.write(json.dumps(tx.as_dict(),indent=4) + '\n')	
-        
-        return out
+                # make unsigned transaction
+                tx = self.make_unsigned_transaction(outputs,fee,change_addr,domain)
+                self.set_label(tx.hash(),label)
+                tx_list.append(tx)
 
+                if self.is_watching_only():		
+                    fileName = os.path.join(saveFolder,'scatter_unsigned_UNSENT_%s.txn' % (tx.hash()[0:8]))
+                    out = ("There were " + str(len(tx_list)) + 
+                            " unsigned scatter transaction files saved successfully into " + saveFolder ) 
+                else:
+                    fileName = os.path.join(saveFolder,'scatter_signed_UNSENT_%s.txn' % (tx.hash()[0:8]))
+                    keypairs = {}
+                    self.add_keypairs_from_wallet(tx, keypairs, password)
+                    if keypairs:
+                        self.sign_transaction(tx, keypairs, password)	
+                    out = ("There were " + str(len(tx_list)) + 
+                        " signed scatter transaction files saved successfully into " + saveFolder + 
+                        ". These are signed and ready to broadcast.")
+            
+                # write transaction to file
+                if fileName:
+                    with open(fileName, "w+") as f:
+                        f.write(json.dumps(tx.as_dict(),indent=4) + '\n')	
+                        
+            #end for tx_data in scatter_tx_data:
+            
+        #end if self.up_to_date and self.network.is_connected():
+        return out
 
     def set_verifier(self, verifier):
         self.verifier = verifier
