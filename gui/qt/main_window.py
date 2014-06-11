@@ -850,6 +850,11 @@ class ElectrumWindow(QMainWindow):
     
     def do_sendslow(self):
 
+
+        if not self.wallet.scatter_on:
+            QMessageBox.warning(self, _('Error'), _('Start the Scatter first. Tools > Scatter > Start Scatter'), _('OK'))
+            return
+        
         label = unicode( self.message_e.text() )
         r = unicode( self.payto_e.text() )
         r = r.strip()
